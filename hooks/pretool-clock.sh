@@ -75,11 +75,11 @@ for line in sys.stdin:
   esac
   [ -n "$model" ] && [ "$model" != "$prev" ] && switched=1
 fi
-[ -n "$model" ] && printf '%s' "$model" > "$mmark" 2>/dev/null
+[ -n "$model" ] && printf '%s' "$model" 2>/dev/null > "$mmark"
 
 # A confirmed swap always speaks, however recently we last emitted.
 [ "$switched" = 1 ] || [ $(( now - last )) -ge "$THRESH" ] || exit 0
-echo "$now" > "$mark" 2>/dev/null
+echo "$now" 2>/dev/null > "$mark"
 
 HUMAN_TZ="${HUMAN_TZ:-UTC}"
 tz=$(TZ="$HUMAN_TZ" date '+%H:%M %Z, %a %d %b')
