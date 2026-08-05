@@ -14,7 +14,7 @@ model=$(jq_ '.model.id'); [ -n "$model" ] || model=$(jq_ '.model.display_name');
 sid=$(jq_ '.session_id'); sid=${sid:-default}   # read THIS session's gauges, not a shared clobbered file
 find ~/.claude -maxdepth 1 \( -name '.gauges.*' -o -name '.burndown-status.*' \) -mtime +1 -delete 2>/dev/null || true
 src="live"
-if [ -z "$fh$ctx" ]; then read -r ctx fh rs < ~/.claude/.gauges."$sid" 2>/dev/null || true; src="statusline<=60s"; fi
+if [ -z "$fh$ctx" ]; then read -r ctx fh rs 2>/dev/null < ~/.claude/.gauges."$sid" || true; src="statusline<=60s"; fi
 
 # A percentage is a number in [0,100]; blank anything else. What lands here in the bug is not
 # random garbage but an EPOCH-SHAPED value — the reset Unix timestamp (~1.7e9, 10 digits) that
