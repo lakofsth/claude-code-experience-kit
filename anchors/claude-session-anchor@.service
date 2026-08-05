@@ -1,0 +1,14 @@
+[Unit]
+Description=Claude Code usage-window anchor (%i)
+# Network needed so the Haiku call can reach the API.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Set to the user whose Claude Code account the window belongs to.
+User=youruser
+# HOME is derived from User=; the runner uses an absolute path to the claude binary.
+ExecStart=/home/youruser/.claude/session-anchor.sh %i
+StandardOutput=append:/home/youruser/.claude/session-anchor.log
+StandardError=append:/home/youruser/.claude/session-anchor.log

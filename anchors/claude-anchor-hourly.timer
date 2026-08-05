@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude usage-window hourly self-healing anchor (every hour except a quiet zone)
+# Design: an hourly ping NO-OPS into any already-open usage window and OPENS one on the
+# hour into silence — stateless, self-healing chaining. Whatever time a window last reset,
+# the next hourly fire re-anchors the chain to an on-the-hour grid. The quiet zone (here
+# 04:00-07:59 — set it to your own deep-sleep hours) parks the indivisible 24-mod-5
+# remainder: any drift accumulated during the day re-locks to the clean grid at the first
+# fire after the gap. Edit both OnCalendar timezones to your own.
+
+[Timer]
+OnCalendar=*-*-* 08..23:00:00 Europe/Helsinki
+OnCalendar=*-*-* 00..03:00:00 Europe/Helsinki
+# Never catch up a missed fire: a stale anchor at the wrong minute is worse than none.
+Persistent=false
+Unit=claude-session-anchor@hourly.service
+
+[Install]
+WantedBy=timers.target
