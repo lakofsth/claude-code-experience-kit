@@ -44,10 +44,28 @@ else
   gauge="${col}${p}%c${R}"
 fi
 
-# Burndown meter (written by ~/.claude/inject-gauges.sh each user turn): tokens/% + turns-to-cap.
-BRN=$'\033[38;5;175m'                              # light mauve
-brd=$(cat ~/.claude/.burndown-status."$sid" 2>/dev/null || true)
-burn=""; [ -n "$brd" ] && burn="  ${BRN}${brd}${R}"
+# ONE SLOT, TWO TENANTS: the session's NAME if the presence registry (§11) knows it, else the
+# burndown meter (tokens/% + turns-to-cap, written by ~/.claude/inject-gauges.sh each user turn).
+#
+# The name wins when it is there because with several sessions open on one host, WHICH WINDOW
+# THIS IS matters more to a person than tokens-per-percent, and every other presence surface
+# (collision warnings, peer notes, listings) already says the name rather than a session id.
+# Nothing is lost to the model either way: §2 injects the burndown into its context every user
+# turn regardless of what this slot shows.
+#
+# The lookup is fail-open, and that is the whole point of the fallback: no presence installed, no
+# names.tsv, or a session that has not registered yet (a beat at session start) and you get the
+# burn readout exactly as before. A kit user who never installs §11 loses nothing.
+SLOT=$'\033[38;5;175m'                             # light mauve
+name=$(awk -F'\t' -v s="$sid" '$2==s {print $1; exit}' \
+       ~/.local/state/claude-sessions/names.tsv 2>/dev/null || true)
+if [ -n "$name" ]; then
+  who="  ${SLOT}${name}${R}"
+else
+  brd=$(cat ~/.claude/.burndown-status."$sid" 2>/dev/null || true)
+  who=""
+  if [ -n "$brd" ]; then who="  ${SLOT}${brd}${R}"; fi
+fi
 
 # 5-hour usage window (only when present) --------------------------------------
 # Show TIME LEFT until the window resets (from resets_at epoch), plus % consumed.
@@ -66,6 +84,6 @@ fi
 printf '%s%s%s%s%s' \
   "$gauge" \
   "$five" \
-  "$burn" \
+  "$who" \
   "${dir:+  ${PTH}${dir}${R}}${branch:+ ${PTH}(${branch})${R}}" \
   "  ${CYN}${model}${R}"
