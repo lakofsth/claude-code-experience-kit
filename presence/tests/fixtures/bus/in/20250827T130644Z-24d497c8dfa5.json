@@ -1,0 +1,14 @@
+{
+ "class": "advisory",
+ "created": 1756300004.0,
+ "from": "claude-ai/brisk-otter",
+ "id": "20250827T130644Z-24d497c8dfa5",
+ "kind": "note",
+ "origin": {
+  "locator": "https://example.invalid/x",
+  "type": "pointer"
+ },
+ "text": "not for you",
+ "to": "some-other-session",
+ "v": 1
+}

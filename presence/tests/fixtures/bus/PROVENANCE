@@ -1,0 +1,9 @@
+written by quintessence.busspool at a quintessence checkout, rev 0300181
+schema v1; regenerate with tests/instruments/make-bus-fixtures.py
+
+20250827T130640Z-876105bfef5d  a quote with its locator
+20250827T130641Z-cb01ac4ede91  a synthesis with its sources
+20250827T130642Z-988a8a221219  a pointer, broadcast
+20250827T130643Z-48e83564e366  a directive, which must point at a HEAD
+20250827T130644Z-24d497c8dfa5  a note for somebody else
+20250827T130645Z-dbc0b2b8233e  a peer announcing its handle
