@@ -60,9 +60,19 @@ import uuid
 LIVE_WINDOW = 1800      # 30 min since last tool call: still "live" for listing and delivery
 TREE_WINDOW = 1800      # 30 min since another session wrote in a tree: worth warning about
 WARN_COOLDOWN = 900     # 15 min: warn once per (peer, tree), not on every Edit
+SKEW_COOLDOWN = 6 * 3600     # the stale-build warning repeats at most this often per session
 REAP_AFTER = 3 * 86400  # records and read notes older than this are removed
 MAX_TREES = 24          # cap the per-record tree map so it cannot grow without bound
 MAX_RENDER = 8          # cap peers/notes named in ONE injection; the rest are counted, not listed
+NAME_PROBES = 64        # rehashes tried before a name falls back to a numeric suffix
+# A name returns to the pool this long after it was issued. SIZED, not picked: measured
+# against the live mapping on 2026-08-26, holding every row for 14 days leaves 286 of the 1024
+# pairs free today, against roughly 17 names/day once minting is deferred to the first tool
+# call -- about 240 in flight in the steady state. Holding for 30 days instead would have left
+# 119 free and nothing cooling until 2026-09-08, so the pool would have run dry in the gap and
+# handed out suffixes for about six days. Raise it once that backlog has cooled; the ceiling is
+# (free pairs) / (names per day), and `agent-presence --names | wc -l` measures the numerator.
+NAME_COOLDOWN = 14 * 86400
 
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 
@@ -144,6 +154,11 @@ def claude_home():
 
 # Session names. Plain, concrete words: a name has to be sayable out loud in a sentence like
 # "what is amber-heron doing in infra", and has to stay legible next to the others in a list.
+#
+# The pool is 32 x 32 = 1024 pairs, and the rate it is consumed at is the whole design problem.
+# Measured 2026-08-26: 2163 names issued in 17 days, so the pool had lapped twice and 58% of all
+# names carried a `-N` suffix. Three mechanisms hold it, and they are sized against each other --
+# widening these two word lists would not have been a fix, only a longer treadmill.
 ADJECTIVES = ("amber", "brisk", "calm", "clear", "copper", "dusk", "early", "fair", "green",
               "hollow", "idle", "keen", "level", "linen", "mellow", "north", "olive", "patient",
               "quiet", "rapid", "slate", "steady", "tidal", "umber", "vivid", "warm", "west",
@@ -154,15 +169,33 @@ NOUNS = ("alder", "badger", "beacon", "birch", "cedar", "crane", "delta", "ember
          "spruce", "thistle", "vale", "willet", "wren")
 
 
-def derive_name(sid):
-    """The BASE name for a session id, before any disambiguation.
+def name_cooldown():
+    """How long a name stays out of the pool after it was issued.
 
-    Deterministic, so an uncontended name can be recomputed from the id it came from. Note the
-    bound, which the prose used to overstate: a name that had to be disambiguated (`-2`) is NOT
-    recoverable this way, because the suffix depends on what was already taken at the time. The
-    mapping is authoritative; this is a fallback for the common, uncontended case.
+    Overridable so the suite can drive the boundary without waiting thirty days, and so the
+    period can be retuned from the environment if the session rate changes again.
     """
-    h = hashlib.sha1((sid or "").encode()).digest()
+    try:
+        return max(0, int(os.environ.get("AGENT_PRESENCE_NAME_COOLDOWN", "")))
+    except ValueError:            # unset, empty, or not a number
+        return NAME_COOLDOWN
+
+
+def derive_name(sid, attempt=0):
+    """The candidate name for a session id at probe number `attempt`.
+
+    Deterministic in both arguments. `attempt=0` is the same arithmetic the first version of
+    this file used, so every uncontended name ever issued is still recomputable from its id.
+
+    Later attempts rehash the id rather than suffixing the attempt-0 name, which is what keeps
+    a contended name a clean two-word pair. Note the bound, and note that the prose here has
+    overstated it before: a name issued at attempt > 0 is not recoverable from the id ALONE,
+    because which attempt won depended on what was taken at the time. It IS recoverable from
+    (id, attempt), and the whole candidate sequence for an id is enumerable, so `names.tsv`
+    stays the authority and this is a check rather than a derivation.
+    """
+    seed = (sid or "").encode() if not attempt else f"{sid or ''}#{attempt}".encode()
+    h = hashlib.sha1(seed).digest()
     return f"{ADJECTIVES[h[0] % len(ADJECTIVES)]}-{NOUNS[h[1] % len(NOUNS)]}"
 
 
@@ -170,49 +203,124 @@ def names_file():
     return os.path.join(state_dir(), "names.tsv")
 
 
-def read_names():
-    """name -> session_id, from the durable mapping. Oldest wins on any duplicate."""
-    out = {}
+def read_name_rows():
+    """Every row of the durable mapping, in file order, as (name, session_id, issued, cwd).
+
+    This is the one reader of the file; the two views below are derived from it. Rows are
+    never removed, so this is the record that answers "which session was amber-heron on the
+    14th" -- and since a cooled name CAN be issued again, that question needs the date.
+    """
+    rows = []
     try:
         with open(names_file()) as fh:
             for line in fh:
                 parts = line.rstrip("\n").split("\t")
-                if len(parts) >= 2 and parts[0] not in out:
-                    out[parts[0]] = parts[1]
+                if len(parts) < 2 or not parts[0] or not parts[1]:
+                    continue
+                try:
+                    issued = int(parts[2]) if len(parts) > 2 else 0
+                except ValueError:
+                    issued = 0
+                rows.append((parts[0], parts[1], issued, parts[3] if len(parts) > 3 else ""))
     except OSError:
         pass
+    return rows
+
+
+def read_names(rows=None):
+    """name -> the session id that holds it NOW. Newest row wins.
+
+    This changed direction when reuse landed, and the change is the point: it used to be
+    oldest-wins, because a name had exactly one holder for all time. It now answers "who is
+    this name" and not "who was it ever" -- `read_name_rows()` answers the second.
+    """
+    out = {}
+    for name, sid, _issued, _cwd in (read_name_rows() if rows is None else rows):
+        out[name] = sid
+    return out
+
+
+def name_of_sid(rows=None):
+    """session id -> the name it runs under. NEWEST row wins.
+
+    Deliberately NOT derived from read_names(): once a name has been reissued, the earlier
+    holder is no longer that name's current owner, and a session must still be recognisable
+    under the name it ran as. This is the view the display path uses.
+
+    A session usually has exactly one row. It can have two: idle past the cooldown, its name
+    reissued to somebody else, and then it acts again and is minted a fresh one. The newest
+    row is the name it is displayed under now, and the older row still answers the dated
+    lookup for the window it held.
+    """
+    out = {}
+    for name, sid, _issued, _cwd in (read_name_rows() if rows is None else rows):
+        out[sid] = name
+    return out
+
+
+def taken_names(rows=None, now=None):
+    """name -> holder, for every name that must not be issued to somebody else right now.
+
+    Two sources, and the invariant binds both -- see tests/INVARIANTS.md,
+    `name-uniqueness-among-the-reachable`:
+
+      1. Mapping rows issued within name_cooldown(). Older rows have cooled and their names
+         return to the pool; `names.tsv` still carries them, so the lookup they exist for is
+         unharmed -- it just needs the date, which every citation of a name already carries.
+      2. Every name a session RECORD currently holds, however old its row is. The mapping can
+         be lost or truncated independently of the records, and a name in use by a live
+         session must never be handed out because the file that recorded it went missing. A
+         review reproduced two simultaneously-live sessions displaying one name; this is the
+         second source that closed it, and the cooldown must not reopen it.
+    """
+    now = time.time() if now is None else now
+    cool = name_cooldown()
+    out = {}
+    for name, sid, issued, _cwd in (read_name_rows() if rows is None else rows):
+        if now - issued <= cool:
+            out[name] = sid
+    for rec in all_records():
+        held = rec.get("name")
+        if isinstance(held, str) and held:
+            out[held] = rec.get("session_id")
     return out
 
 
 def assign_name(sid, cwd=None):
-    """This session's name, allocated once and never reused for a different session.
+    """This session's name, minted once and recorded for good.
 
-    Disambiguated against every name ever issued rather than only the live ones, because the
-    point of the mapping is to answer "which session was amber-heron" days later -- a name
-    that meant two different sessions could not answer it.
+    Called only from paths that mean a session needs a human-legible name -- see
+    tests/INVARIANTS.md, `a-name-is-minted-only-for-a-session-that-acts`. The SessionStart
+    path deliberately does NOT call it: 87% of records measured on 2026-08-26 belonged to
+    `claude -p` one-shots that register, answer, and end without ever taking a tool call, and
+    naming them was what emptied the pool.
     """
     os.makedirs(state_dir(), exist_ok=True)
     with open(names_file() + ".lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            taken = read_names()
-            # Also every name a session RECORD currently holds. The mapping is the durable
-            # source, but it can be lost or truncated independently of the records, and a name
-            # in use by a live session must not be handed to another one merely because the
-            # file that recorded it went missing. Found by review, which reproduced two
-            # simultaneously-live sessions both displaying the same name.
-            for rec in all_records():
-                held = rec.get("name")
-                if isinstance(held, str) and held and held not in taken:
-                    taken[held] = rec.get("session_id")
-            for name, owner in taken.items():
-                if owner == sid:
-                    return name
-            base = derive_name(sid)
-            name, n = base, 1
-            while name in taken:
-                n += 1
-                name = f"{base}-{n}"
+            rows = read_name_rows()
+            mine = name_of_sid(rows).get(sid)
+            # Only if nobody has been given it since. A session idle past the cooldown can
+            # come back to find its name reissued; it is then a different session's name and
+            # returning it here would put two live sessions under one.
+            if mine and read_names(rows).get(mine) == sid:
+                return mine
+            taken = taken_names(rows)
+            for attempt in range(NAME_PROBES):
+                name = derive_name(sid, attempt)
+                if name not in taken:
+                    break
+            else:
+                # Every probe collided, which means the pool is effectively full. The numeric
+                # suffix is kept for exactly this case and no other: a `-N` name is now the
+                # LOUD signal that there are no free pairs left, rather than the ordinary
+                # outcome of two ids hashing alike.
+                base, n = derive_name(sid), 1
+                name = base
+                while name in taken:
+                    n += 1
+                    name = f"{base}-{n}"
             with open(names_file(), "a+") as fh:
                 # A previous writer killed mid-write leaves a line with no newline; appending
                 # after it FUSES two rows into one, and the older row's id becomes garbage --
@@ -237,9 +345,9 @@ def name_for(sid, rec=None):
     # rather than at the three places that concatenate it. Found by review.
     if rec and rec.get("name"):
         return one_line(rec["name"], 40)
-    for name, owner in read_names().items():
-        if owner == sid:
-            return one_line(name, 40)
+    mine = name_of_sid().get(sid)
+    if mine:
+        return one_line(mine, 40)
     return short(sid)
 
 
@@ -469,6 +577,10 @@ def installed_cli_version():
     return None
 
 
+def fmt_version(t):
+    return ".".join(str(n) for n in t)
+
+
 def version_skew_note(sid, names=None):
     """A warning for a session whose process is older than what is installed, or None.
 
@@ -479,8 +591,14 @@ def version_skew_note(sid, names=None):
     silently missing cross-session messaging, and it surfaced only because something went
     looking for a socket it could not have.
 
-    Addressed to the affected session itself, because it is the only party that can act, and
-    at SessionStart because that is the one moment a cleared conversation reliably reaches.
+    Addressed to the affected session itself, because it is the only party that can act. It is
+    emitted from the PreToolUse hook, NOT from SessionStart, and that distinction is the whole
+    of defect D284: naming the right audience is not reaching it. `/clear` starts a new
+    conversation in the same process, so a long-lived process reaches SessionStart only when it
+    is cleared -- and the population this warning is about is exactly the population that has
+    been cleared least. Measured four and a half hours after the warning first shipped, its own
+    founding case had been in conversation for seven hours and could never have been told. A
+    tool call is the event a live session does reach.
     """
     names = messaging_names() if names is None else names
     entry = names.get(sid) or {}
@@ -488,7 +606,7 @@ def version_skew_note(sid, names=None):
     installed = installed_cli_version()
     if not running or not installed or running >= installed:
         return None
-    fmt = lambda t: ".".join(str(n) for n in t)
+    fmt = fmt_version
     note = (f"THIS SESSION IS RUNNING CLAUDE CODE {fmt(running)}, BUT {fmt(installed)} IS "
             f"INSTALLED. `/clear` starts a new conversation in the same process, so clearing "
             f"will never pick the new build up — only quitting this process and starting a "
@@ -513,7 +631,7 @@ def messaging_label(sid, names=None):
     return f" = {entry['name']}"
 
 
-def touch(sid, cwd=None, tree=None, started=None):
+def touch(sid, cwd=None, tree=None, started=None, mint=False):
     """Refresh this session's own record, under an exclusive lock.
 
     A session writes only its OWN file, but that is not the same as having one writer: the
@@ -531,19 +649,21 @@ def touch(sid, cwd=None, tree=None, started=None):
     with open(lock_file, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            return _touch_locked(sid, path, now, cwd, tree, started)
+            return _touch_locked(sid, path, now, cwd, tree, started, mint)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def _touch_locked(sid, path, now, cwd, tree, started):
+def _touch_locked(sid, path, now, cwd, tree, started, mint=False):
     rec = read_record(path) or {
         "session_id": sid,
         "started": started if started is not None else now,
         "trees": {},
     }
     rec["last_seen"] = now
-    if not rec.get("name"):
+    # Only when the caller says this session needs a name. Registering does not; taking a tool
+    # call does. See tests/INVARIANTS.md, `a-name-is-minted-only-for-a-session-that-acts`.
+    if mint and not rec.get("name"):
         rec["name"] = assign_name(sid, cwd)
     if cwd:
         rec["cwd"] = cwd
@@ -595,9 +715,26 @@ def reap(now=None):
                 os.unlink(p)
         except OSError:
             pass
+    # Warning-cooldown markers age out too. They were the one state directory nothing swept:
+    # a marker is minted per (session, peer, tree) and per (session, version-skew, build), and
+    # sessions are ephemeral, so the set only ever grew -- 167 files were standing when this
+    # was found. REAP_AFTER is far longer than either cooldown, so reaping can never cut one
+    # short; the worst a removed marker can do is allow one duplicate warning.
+    wdir = os.path.join(state_dir(), "warn")
+    for name in os.listdir(wdir) if os.path.isdir(wdir) else []:
+        p = os.path.join(wdir, name)
+        try:
+            if now - os.path.getmtime(p) > REAP_AFTER:
+                os.unlink(p)
+        except OSError:
+            pass
     # Both delivered AND undelivered notes age out. Undelivered ones used to be exempt, which
     # meant every broadcast to a session that then ended left a file nothing would ever remove
     # -- unbounded growth, since cmd_end unlinks the record but not the inbox.
+    # The bus legs, swept by their own function next door because they are a different shape:
+    # two flat directories of records, not a tree of per-session inboxes. Called from here so
+    # the bus is bounded by the thing that already runs, rather than by a caller remembering.
+    reap_bus(now=now, max_age=REAP_AFTER)
     for root, _dirs, files in os.walk(os.path.join(state_dir(), "inbox")):
         for f in files:
             if not f.endswith(".json"):
@@ -731,8 +868,13 @@ def _warn_marker(sid, other_sid, tree):
     return os.path.join(state_dir(), "warn", key)
 
 
-def warn_due(sid, other_sid, tree, now=None):
-    """Whether this peer-and-tree is outside its cooldown. PURE CHECK -- records nothing.
+def warn_due(sid, other_sid, tree, now=None, cooldown=WARN_COOLDOWN):
+    """Whether this subject is outside its cooldown. PURE CHECK -- records nothing.
+
+    `cooldown` defaults to the collision period, so the peer-and-tree caller is unchanged. The
+    stale-build warning passes its own: a collision is worth repeating every 15 minutes because
+    the other session may have moved on, while a stale build is a standing condition only the
+    person can clear, and 15-minute nagging over a ten-day session is 960 identical warnings.
 
     Splitting the decision from the record is the fix for a real defect: the marker used to be
     written here, at the moment of deciding, while the emit happens later and every hook path
@@ -742,7 +884,7 @@ def warn_due(sid, other_sid, tree, now=None):
     """
     now = now if now is not None else time.time()
     try:
-        return (now - os.path.getmtime(_warn_marker(sid, other_sid, tree))) >= WARN_COOLDOWN
+        return (now - os.path.getmtime(_warn_marker(sid, other_sid, tree))) >= cooldown
     except OSError:
         return True
 
@@ -826,6 +968,239 @@ def claim_notes(sid):
     return out
 
 
+# --------------------------------------------------------------------------- the session bus
+
+# The hosted half of inter-session traffic: a session running somewhere else (claude.ai, a
+# hosted agent) writes a note into bus/in through a relay, and a local session picks it up here.
+# The relay this was built against is the quintessence project's `busspool` writer; any writer
+# that produces the fixture schema (tests/fixtures/bus/) is read the same way.
+#
+# THIS FILE CARRIES ITS OWN READER RATHER THAN IMPORTING `quintessence.busspool`, WHICH WROTE
+# THE NOTES. That is a deliberate cost, paid for one reason: this program is a PreToolUse hook
+# that runs before every tool call of every session on the host, and its import list is nine
+# stdlib modules. An import reaching into another repo's deploy tree would make a missing,
+# half-installed or broken checkout of that project break every tool call on the machine — a far
+# worse failure than the schema drift the duplication risks. The two also ship by different
+# mechanisms (a symlink here, a pinned /opt checkout there), so they could never be updated in
+# one act anyway. What holds them together instead is a conformance test over fixtures the REAL
+# writer produced: tests/fixtures/bus/, regenerated by tests/instruments/make-bus-fixtures.py.
+BUS_LEGS = ("in", "out")
+BUS_TRAFFIC_KINDS = ("note", "ask", "reply")
+BUS_SEEN_CAP = 32          # ids remembered beyond the watermark; bounds the record's growth
+MAX_BUS_EXCERPT = 400      # what one hosted note may occupy in an injection
+
+
+def bus_dir():
+    return os.path.join(state_dir(), "bus")
+
+
+def bus_leg_dir(leg):
+    return os.path.join(bus_dir(), leg)
+
+
+def read_bus_records(leg):
+    """Every readable record in a leg, oldest first, as `(id, record)`.
+
+    A file that does not parse is SKIPPED, not raised on: one corrupt record — a kill mid-write,
+    a hand-edit, a peer running an older build — must not deny this session every other note
+    queued behind it, and this runs on the path that precedes every tool call.
+    """
+    d = bus_leg_dir(leg)
+    out = []
+    try:
+        names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
+    except OSError:
+        return out
+    for n in names:
+        try:
+            with open(os.path.join(d, n)) as fh:
+                rec = json.load(fh)
+        except Exception:
+            continue
+        if isinstance(rec, dict):
+            out.append((n[:-5], rec))
+    return out
+
+
+def bus_addressed_to_me(rec, sid, names=None):
+    """Does this hosted note name this session?
+
+    A hosted sender addresses by whatever `list_peers` showed it, which is the presence name;
+    `*` is the broadcast. The session id and its short form are accepted too because a note
+    composed from a transcript may carry either.
+    """
+    to = rec.get("to")
+    if not isinstance(to, str) or not to:
+        return False
+    if to == "*":
+        return True
+    mine = {sid, short(sid)}
+    n = name_for(sid)
+    if n:
+        mine.add(n)
+    mn = (names or messaging_names()).get(sid)
+    if mn:
+        mine.add(mn)
+    return to in mine
+
+
+def bus_new_for(sid, rec, records):
+    """The records this session has not already taken, newest-watermark logic.
+
+    Ids sort in mint order, so a watermark answers this in one comparison. The exception it
+    cannot answer alone is a note minted in the SAME SECOND as the watermark and landing after
+    it: within one second ids order by their random half, so such a note can sort below a
+    watermark this session has already passed. Those are caught by a bounded set of recently
+    taken ids, consulted only for that same second — an older id absent from the set is treated
+    as already seen, because re-delivering a note is worse than missing a straggler and the set
+    is deliberately not a full history.
+    """
+    wm = rec.get("bus_seen_max") or ""
+    seen = set(rec.get("bus_seen") or ())
+    out = []
+    for rid, r in records:
+        if rid > wm:
+            out.append((rid, r))
+        elif wm and rid[:16] == wm[:16] and rid not in seen:
+            out.append((rid, r))
+    return out
+
+
+def bus_note_to_local(rid, rec):
+    """Turn a hosted record into the local note shape the inbox and renderer already handle.
+
+    Reusing the local inbox rather than rendering straight from the bus is what buys the
+    properties that path already has and this one would otherwise have to re-earn: claim by
+    atomic rename, so two concurrent hooks cannot both deliver one note; per-note containment
+    at render; and one reaper for delivered and undelivered alike.
+    """
+    origin = rec.get("origin") if isinstance(rec.get("origin"), dict) else {}
+    return {
+        "from": None,
+        "from_label": rec.get("from"),
+        "hosted": True,
+        "bus_id": rid,
+        "ts": rec.get("created") or 0,
+        "class": rec.get("class"),
+        "ref": rec.get("ref"),
+        "kind": rec.get("kind"),
+        "text": rec.get("text"),
+        "origin_type": origin.get("type"),
+        "origin_locator": origin.get("locator"),
+        "origin_sources": origin.get("sources"),
+    }
+
+
+def bus_ingest(sid):
+    """Move hosted notes addressed to this session into its own inbox. Returns how many.
+
+    Under the session's own lock, and the watermark is written in the SAME critical section as
+    the copy: a crash between the two would otherwise either lose a note or deliver it twice on
+    the next call, and which of those you get would depend on the order of two unlocked writes.
+    """
+    records = [(rid, r) for rid, r in read_bus_records("in")
+               if r.get("kind") in BUS_TRAFFIC_KINDS]
+    if not records:
+        return 0
+    path = record_path(sid)
+    taken = 0
+    try:
+        with open(lock_path(sid), "a+") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            rec = read_record(path)
+            if rec is None:
+                return 0
+            names = messaging_names()
+            fresh = [(rid, r) for rid, r in bus_new_for(sid, rec, records)
+                     if bus_addressed_to_me(r, sid, names)]
+            if not fresh:
+                return 0
+            seen = list(rec.get("bus_seen") or ())
+            for rid, r in fresh:
+                try:
+                    write_note(sid, bus_note_to_local(rid, r))
+                except Exception:
+                    continue    # one unwritable note must not cost the others
+                seen.append(rid)
+                taken += 1
+            if not taken:
+                return 0
+            rec["bus_seen"] = seen[-BUS_SEEN_CAP:]
+            rec["bus_seen_max"] = max([rid for rid, _r in fresh]
+                                      + [rec.get("bus_seen_max") or ""])
+            atomic_write(path, rec)
+    except OSError:
+        return 0
+    return taken
+
+
+def hosted_peers(now=None):
+    """Hosted sessions that have announced a handle, newest first.
+
+    They are records in the same leg as the traffic — the bus face may write exactly one
+    directory, so its own bookkeeping goes where its notes go. LIVE_WINDOW is not applied: a
+    hosted session gives no sign of being alive between calls, so the honest statement is when
+    it announced itself, not whether it is still there.
+    """
+    now = time.time() if now is None else now
+    out = {}
+    for _rid, r in read_bus_records("in"):
+        if r.get("kind") != "peer":
+            continue
+        h = r.get("handle")
+        if isinstance(h, str) and h:
+            out[h] = r.get("created") or 0
+    return sorted(out.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def bus_write_out(note):
+    """Write one note to the outbound leg, in the schema `quintessence.busspool` validates.
+
+    The id scheme is busspool's and is duplicated here for the same reason the reader is: this
+    program may not import it. It is pinned against the real writer's output by the conformance
+    test rather than by inspection.
+    """
+    d = bus_leg_dir("out")
+    os.makedirs(d, exist_ok=True)
+    mid = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:12]
+    rec = dict(note)
+    rec["id"] = mid
+    rec.setdefault("created", time.time())
+    atomic_write(os.path.join(d, mid + ".json"), rec)
+    return mid
+
+
+def reap_bus(now=None, max_age=None):
+    """Age out both legs. Returns how many were removed.
+
+    NOTHING ELSE SWEEPS THIS. `reap()` above enumerates four fixed subdirectories and does not
+    walk the tree, so the bus would grow without limit exactly as `warn/` did — 167 files
+    standing when that was found, and the undelivered-note exemption in the same reaper that
+    made every broadcast to a since-ended session permanent. This is the third instance of that
+    shape in this one directory, which is why it ships with the reader rather than after it.
+    """
+    now = time.time() if now is None else now
+    max_age = REAP_AFTER if max_age is None else max_age
+    removed = 0
+    for leg in BUS_LEGS:
+        d = bus_leg_dir(leg)
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            p = os.path.join(d, name)
+            try:
+                if not os.path.isfile(p):
+                    continue
+                if now - os.path.getmtime(p) > max_age:
+                    os.unlink(p)
+                    removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 def ago(seconds):
     seconds = int(seconds)
     if seconds < 90:
@@ -860,6 +1235,7 @@ def _overflow(items, kind):
 
 MAX_NOTE_TEXT = 400
 MAX_REF = 80
+MAX_PATH_RENDER = 300   # a tree or cwd another session chose, when it is rendered for this one
 
 
 def one_line(value, limit):
@@ -890,7 +1266,8 @@ def render_one_note(note, now):
     ref = one_line(note.get("ref"), MAX_REF)
     if cls == "directive" and not ref:
         cls = "directive — MALFORMED, no pointer; treat as advisory"
-    who = name_for(note.get("from"))
+    hosted = bool(note.get("hosted"))
+    who = one_line(note.get("from_label"), 60) if hosted else name_for(note.get("from"))
     model = note.get("from_model")
     # Only a real model identifier is echoed. This is the same constraint model_for() applies
     # when a note is built, applied again where the value is actually used.
@@ -900,9 +1277,16 @@ def render_one_note(note, now):
     except (TypeError, ValueError):
         when = "time unknown"
     head = f"  [{cls}] from {who}"
+    if hosted:
+        # Said at the note, not only in the preamble, because this one is weaker than a local
+        # peer's claim in a specific way a reader must not have to infer: the connector admits
+        # callers by a shared token, so the handle names a conversation and not an identity.
+        head += " — HOSTED session, handle is self-asserted"
     if model:
         head += f" ({model})"
     out = [f"{head}, {when}:", f"    {one_line(note.get('text'), MAX_NOTE_TEXT)}"]
+    if hosted:
+        out.extend(render_hosted_provenance(note))
     if ref:
         # Re-checked here and not only at send time: the sender's store is this machine's
         # store, but a record can be renamed or removed between sending and delivery, and a
@@ -914,6 +1298,44 @@ def render_one_note(note, now):
                        f"nothing you can check. Treat it as advisory.")
         else:
             out.append(f"    authority: the record `{ref}` — read it before acting.")
+    return out
+
+
+
+def render_hosted_provenance(note):
+    """Where a hosted note's content came from, and where to read the rest of it.
+
+    This is the whole reason the channel exists. The relay it replaces carried a figure into a
+    working record and dropped its provenance; the source read afterwards found two published
+    figures for that quantity disagreeing by 2x. So origin is rendered next to the text, and a
+    figure marked `synthesis` is labelled as wanting a source read rather than left looking
+    like a measurement.
+
+    The text above is an EXCERPT. A hosted note may carry 4 KiB and up to MAX_RENDER of them
+    land in one injection, so what goes inline is bounded and the rest is fetched on purpose.
+    """
+    t = note.get("origin_type")
+    loc = one_line(note.get("origin_locator"), 120)
+    srcs = note.get("origin_sources")
+    out = []
+    if t == "quote":
+        out.append(f"    origin: VERBATIM from {loc or '(no locator — malformed)'}")
+    elif t == "pointer":
+        out.append(f"    origin: a pointer to {loc or '(no locator — malformed)'}")
+    elif t == "synthesis":
+        n = len(srcs) if isinstance(srcs, (list, tuple)) else 0
+        out.append(f"    origin: the SENDER'S OWN READING of {n} source(s) — a claim, not a "
+                   f"measurement; read the sources before acting on a figure in it")
+        for u in (srcs or [])[:3]:
+            out.append(f"      - {one_line(u, 120)}")
+        if n > 3:
+            out.append(f"      (+{n - 3} more not listed)")
+    else:
+        out.append(f"    origin: MALFORMED ({one_line(t, 30) or 'absent'}) — this note does not "
+                   f"say where its content came from; treat every claim in it as unsourced")
+    bid = one_line(note.get("bus_id"), 40)
+    if bid:
+        out.append(f"    full text: agent-presence --note {bid}")
     return out
 
 
@@ -936,6 +1358,10 @@ def render_notes(notes):
 
 
 def render_collision(tree, hits):
+    # The tree is a path a PEER chose (its Edit target, realpath'd): a directory name can carry
+    # a newline, and this line is injected into THIS session's context outside any per-note
+    # framing. Flattened and bounded the same way a note body is (one_line), for the same reason.
+    tree = one_line(tree, MAX_PATH_RENDER)
     lines = [f"⚠ ANOTHER LIVE SESSION IS WORKING IN {tree} — you are about to write there."]
     hits, dropped = _overflow(hits, "sessions")
     for rec, age in hits:
@@ -974,11 +1400,46 @@ def read_payload():
         return {}
 
 
+# A session id is used as ONE path component -- the record, the touch lock and the inbox are
+# all `<state>/<kind>/<sid>...`, and cmd_end unlinks the record by it -- so an id is accepted
+# only in a shape that cannot leave the registry: the harness's own ids are UUIDs, and the
+# suite's are short words. Anything else (a separator, a dot-run, an empty string, a non-string)
+# is treated as no id at all, which every hook entry already answers with silence.
+SID_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+
+
+def payload_sid(payload):
+    """The session id the hook was invoked for, or None when it is absent or not a path-safe
+    single component."""
+    sid = payload.get("session_id") if isinstance(payload, dict) else None
+    if not isinstance(sid, str) or not SID_SHAPE.fullmatch(sid):
+        return None
+    return sid
+
+
 # --------------------------------------------------------------------------- hook entries
+
+def _self_identity_line(sid, mnames):
+    """What to tell a session about its own identity at SessionStart.
+
+    A presence name is not minted here (see `assign_name`), so a session that has not yet
+    taken a tool call has none, and the honest line says when it arrives rather than printing
+    a raw id under a heading that promises a name. A resumed or already-working session does
+    have one, and reads exactly what it always read.
+    """
+    named = name_of_sid().get(sid)
+    if named:
+        return (f"YOU ARE {named}{messaging_label(sid, mnames)} (session {short(sid)}). "
+                "Sign notes to peers with that name.")
+    return (f"YOU ARE session {short(sid)}{messaging_label(sid, mnames)} — your presence name "
+            "is minted on your first tool call; `agent-presence` marks it `*` and "
+            "`agent-presence --whoami` prints it. Peers can reach you by session-id prefix "
+            "either way.")
+
 
 def cmd_register():
     payload = read_payload()
-    sid = payload.get("session_id")
+    sid = payload_sid(payload)
     if not sid:
         return 0
     ensure_dirs()
@@ -986,22 +1447,26 @@ def cmd_register():
     touch(sid, cwd=payload.get("cwd"))
     mnames = messaging_names()
     lines = []
-    # Deliberately BEFORE the peers check and outside it. A stale process is most dangerous
-    # when it is alone -- there is then nobody whose absence of a reply would hint at it --
-    # so this warning must not be conditional on having company.
-    skew = version_skew_note(sid, mnames)
-    if skew:
-        lines.append(skew)
+    # The stale-build warning used to be emitted here. It is now in cmd_pretool: this event is
+    # the one a long-lived process reaches LEAST, and a long-lived process is what the warning
+    # is about. See tests/INVARIANTS.md, `a-warning-reaches-the-population-it-is-about`.
     others = peers(sid)
+    hosted_lines = render_hosted_peers()
     if not others:
-        if lines:
-            emit("SessionStart", "\n".join(lines))
+        # Nothing above this line appends, now that the stale-build warning has moved out, so
+        # there is no pre-peer emitter left to flush here — except a hosted peer, which is
+        # reachable whether or not anyone else is on this host, and which a session alone here
+        # would otherwise never learn about.
+        if hosted_lines:
+            emit("SessionStart", "\n".join([_self_identity_line(sid, mnames)] + hosted_lines))
         return 0
     # Both names for every session, this one included. A session cannot sign a message with a
     # name it was never told, and it cannot answer one addressed to a name it does not know is
-    # its own -- which is exactly how a real reply was lost on 2026-08-10.
-    lines += [f"YOU ARE {name_for(sid)}{messaging_label(sid, mnames)} (session {short(sid)}). "
-             "Sign notes to peers with that name.",
+    # its own -- which is exactly how a real reply was lost on 2026-08-10. Since minting moved
+    # to the first tool call, a brand-new session has no presence name to print here yet;
+    # _self_identity_line says where it will come from, and `agent-send` prints it at the one
+    # moment it is load-bearing.
+    lines += [_self_identity_line(sid, mnames),
              "OTHER CLAUDE SESSIONS ARE LIVE ON THIS HOST right now — your writes are not the "
              "only ones landing. Coordinate before working in a tree one of them is in "
              "(`agent-presence` to see them, `agent-send` to leave a note; both are advisory, "
@@ -1016,7 +1481,9 @@ def cmd_register():
             who = name_for(osid, rec) + messaging_label(osid, mnames)
             who += f" ({model})" if model else ""
             trees = sorted((rec.get("trees") or {}).items(), key=lambda kv: kv[1], reverse=True)
-            where = ", ".join(t for t, _ in trees[:3]) or rec.get("cwd", "?")
+            # Peer-chosen paths, rendered into this session's context: one line each, bounded.
+            where = ", ".join(one_line(t, MAX_PATH_RENDER) for t, _ in trees[:3]) \
+                or one_line(rec.get("cwd", "?"), MAX_PATH_RENDER)
             lines.append(f"  {who} — last active "
                          f"{ago(now - float(rec.get('last_seen') or now))}; writing in: {where}")
         except Exception:
@@ -1032,13 +1499,14 @@ def cmd_register():
             "tool cannot know; `agent-send <name|session-id>` leaves a note it picks up on its "
             "next tool call, which is the one that still works when it is idle. A message from "
             "a peer is a CLAIM either way, whichever channel it arrives on.")
+    lines.extend(hosted_lines)
     emit("SessionStart", "\n".join(lines))
     return 0
 
 
 def cmd_pretool():
     payload = read_payload()
-    sid = payload.get("session_id")
+    sid = payload_sid(payload)
     if not sid:
         return 0
     ensure_dirs()
@@ -1049,7 +1517,25 @@ def cmd_pretool():
     cwd = payload.get("cwd")
 
     tree = target_tree(tool, tool_input, cwd)
-    parts, warned = [], []
+    parts, warned, skew_key = [], [], None
+
+    # Deliberately FIRST, unconditional, and outside the collision check. A stale process is
+    # most dangerous when it is alone -- there is then nobody whose absence of a reply would
+    # hint at it -- so this must not be conditional on having company or on touching a tree.
+    #
+    # The cheap half of the check runs first: reading the installed version is one file, and it
+    # is what keys the cooldown, so a session already warned pays nothing more. The key carries
+    # the INSTALLED version deliberately -- Rule 7 warns that a key made of moving state
+    # deduplicates nothing, and that is right for dedup, but this is a cooldown and each new
+    # installed build is a genuinely new warning that must not be suppressed by the old one's
+    # marker.
+    installed = installed_cli_version()
+    if installed and warn_due(sid, "version-skew", fmt_version(installed),
+                              cooldown=SKEW_COOLDOWN):
+        skew = version_skew_note(sid)
+        if skew:
+            parts.append(skew)
+            skew_key = fmt_version(installed)
 
     # What stops a session colliding with itself is the session_id filter in peers(), NOT the
     # order of these two steps -- a mutation that moved the touch above this block survived the
@@ -1061,7 +1547,24 @@ def cmd_pretool():
             parts.append(render_collision(tree, hits))
             warned = [rec.get("session_id") for rec, _age in hits]
 
-    touch(sid, cwd=cwd, tree=tree)
+    # Minting happens HERE and not at SessionStart: a tool call is the first evidence that
+    # this session is one a person will need to name. It stays silent -- an injection on every
+    # session's first tool call would break the property that these hooks say nothing unless
+    # there is a collision or a note, and a session learns its name from `agent-presence`
+    # (which marks it `*`), from `--whoami`, or from the line `agent-send` prints when it
+    # sends. Nothing needs the name before one of those.
+    touch(sid, cwd=cwd, tree=tree, mint=True)
+
+    # Hosted notes join the local inbox HERE, before it is claimed, so they travel the rest of
+    # the way on the path that already solved delivery: claim by atomic rename (two concurrent
+    # hooks cannot both render one note), per-note containment at render, one reaper. Failure is
+    # swallowed for the same reason every other step here is — a hook that breaks a tool call is
+    # worse than a hook that misses a note, and the note is still in the leg to be taken next
+    # time.
+    try:
+        bus_ingest(sid)
+    except Exception:
+        pass
 
     notes = claim_notes(sid)
     if notes:
@@ -1074,12 +1577,17 @@ def cmd_pretool():
         # committed, so the next call warns again instead of silently swallowing it.
         for other in warned:
             warn_commit(sid, other, tree)
+        # Same split, same reason: the cooldown is committed when the warning was DELIVERED,
+        # never when it was decided. Anything raising in between leaves this uncommitted and
+        # the next tool call warns again, which is the safe direction.
+        if skew_key:
+            warn_commit(sid, "version-skew", skew_key)
     return 0
 
 
 def cmd_end():
     payload = read_payload()
-    sid = payload.get("session_id")
+    sid = payload_sid(payload)
     if not sid:
         return 0
     try:
@@ -1092,9 +1600,74 @@ def cmd_end():
 
 # --------------------------------------------------------------------------- human CLIs
 
+def render_hosted_peers():
+    """Hosted handles that have announced themselves, for the peer listing.
+
+    Deliberately NOT filtered by a liveness window like local sessions are. A hosted session
+    is invisible between its own calls, so `is it live` has no answer here and printing an
+    inferred one would be worse than printing when it last said anything.
+    """
+    peers_h = hosted_peers()
+    if not peers_h:
+        return []
+    now = time.time()
+    shown, dropped = _overflow(peers_h, "hosted handles")
+    out = ["", "hosted sessions (claude.ai / Cowork) that have announced a handle:"]
+    for h, t in shown:
+        try:
+            when = ago(now - float(t))
+        except (TypeError, ValueError):
+            when = "time unknown"
+        out.append(f"  {h}  — announced {when}; reachable with "
+                   f"`agent-send {h} \"...\" --origin ...`")
+    if dropped:
+        out.append(dropped)
+    out.append("  (a handle is self-asserted: the connector admits by a shared token, so it "
+               "names a conversation, not an identity)")
+    return out
+
+
+def cmd_note(argv):
+    """Print one bus record in full — the text an injection could only excerpt.
+
+    ONE record, identified by the id the injection printed, looked up in whichever leg holds
+    it. Read-only: it neither claims, marks, nor removes anything, so running it twice is the
+    same as running it once and it can be run on a note another session has already taken.
+    """
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage: agent-presence --note <bus-id>", file=sys.stderr)
+        return 2
+    want = argv[0]
+    for leg in BUS_LEGS:
+        for rid, rec in read_bus_records(leg):
+            if rid != want:
+                continue
+            origin = rec.get("origin") if isinstance(rec.get("origin"), dict) else {}
+            print(f"id:      {rid}   (leg: {leg})")
+            print(f"from:    {rec.get('from')}"
+                  + ("   [hosted — self-asserted handle]" if leg == "in" else ""))
+            print(f"to:      {rec.get('to')}")
+            print(f"kind:    {rec.get('kind')}   class: {rec.get('class')}")
+            if rec.get("ref"):
+                print(f"points at record: {rec['ref']}")
+            print(f"origin:  {origin.get('type')}")
+            if origin.get("locator"):
+                print(f"         locator: {origin['locator']}")
+            for u in (origin.get("sources") or []):
+                print(f"         source:  {u}")
+            print()
+            print(rec.get("text") or "")
+            return 0
+    print(f"agent-presence: no bus record {want}. Records age out after "
+          f"{REAP_AFTER // 86400} days.", file=sys.stderr)
+    return 3
+
+
 def cmd_list(argv):
     as_json = "--json" in argv
     show_all = "--all" in argv
+    if "--note" in argv:
+        return cmd_note(argv[argv.index("--note") + 1:])
     if "--whoami" in argv:
         # A sender has to be able to say who it is. Before this existed the only route to
         # your own name was to run the list and recognise your own cwd among the rows, which
@@ -1117,20 +1690,26 @@ def cmd_list(argv):
     if "--names" in argv:
         # The name -> id mapping, in full. Names are surfaced everywhere else instead of ids,
         # so this is the lookup for the times you need the id back -- a transcript path, a
-        # commit trailer, a log line. It outlives the registry: entries are never reaped, and
-        # a name is never reissued to a different session.
-        print(f"{'NAME':<20} {'SESSION ID':<38} FIRST SEEN")
-        try:
-            with open(names_file()) as fh:
-                rows = [ln.rstrip("\n").split("\t") for ln in fh]
-        except OSError:
-            rows = []
-        for row in rows:
-            if len(row) < 3:
-                continue
-            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(row[2])))
-            print(f"{row[0]:<20} {row[1]:<38} {when}")
-        if not rows:
+        # commit trailer, a log line. It outlives the registry: entries are never reaped.
+        #
+        # A name CAN be issued again once it has cooled (NAME_COOLDOWN), so the key here is
+        # (name, date) and not the name alone -- which is why every row prints its date and
+        # the current holder is marked. Pass a name to see just its holders:
+        #   agent-presence --names amber-heron
+        want = next((a for a in argv[argv.index("--names") + 1:] if not a.startswith("-")), None)
+        rows = read_name_rows()
+        holder = read_names(rows)
+        shown = [r for r in rows if want is None or r[0] == want]
+        print(f"{'NAME':<20} {'SESSION ID':<38} {'ISSUED':<17} HELD")
+        for name, sid, issued, _cwd in shown:
+            when = (time.strftime("%Y-%m-%d %H:%M", time.localtime(issued)) if issued
+                    else "(undated)")
+            now = "current" if holder.get(name) == sid else "past"
+            print(f"{name:<20} {sid:<38} {when:<17} {now}")
+        if not shown and want is not None:
+            print(f"(no name {want!r} has ever been issued — {len(rows)} rows in "
+                  f"{names_file()})")
+        elif not shown:
             print(f"(no names issued yet — mapping lives at {names_file()})")
         return 0
     now = time.time()
@@ -1147,6 +1726,8 @@ def cmd_list(argv):
     if not recs:
         print("no live Claude sessions registered"
               f" (registry: {os.path.join(state_dir(), 'sessions')})")
+        for line in render_hosted_peers():
+            print(line)
         return 0
     self_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     mnames = messaging_names()
@@ -1160,7 +1741,7 @@ def cmd_list(argv):
             msg += "!"   # named, but no SendMessage socket -- agent-send still reaches it
         line = (f"{mark} {name_for(sid, r):<18} {msg:<12} {short(sid)}  {model:<15} "
                 f"seen {ago(now - float(r.get('last_seen') or now)):<9} "
-                f"cwd {r.get('cwd', '?')}")
+                f"cwd {one_line(r.get('cwd', '?'), MAX_PATH_RENDER)}")
         pend = len(pending_notes(sid))
         if pend:
             line += f"  [{pend} note(s) undelivered]"
@@ -1168,6 +1749,8 @@ def cmd_list(argv):
         for tree, ts in sorted((r.get("trees") or {}).items(),
                                key=lambda kv: kv[1], reverse=True)[:5]:
             print(f"      wrote {tree}  {ago(now - float(ts))}")
+    for line in render_hosted_peers():
+        print(line)
     return 0
 
 
@@ -1189,7 +1772,74 @@ SEND_USAGE = """usage: agent-send [--tree PATH | --all | SESSION-ID-PREFIX] "tex
                      the inbox carries attention. Set AGENT_PRESENCE_REF_DIR to have the
                      pointer checked; unset, it is an opaque label.
 
+  claude-ai/HANDLE  a HOSTED session (claude.ai / Cowork), reached over the session bus.
+                    It cannot see this machine, so a note to it MUST say where its content
+                    came from:
+                      --origin quote     verbatim  -> --locator <URL|DOI|repo@sha>
+                      --origin pointer   a locator -> --locator <URL|DOI|repo@sha>
+                      --origin synthesis your own reading -> --source <url> (repeatable)
+                    Handles come from `agent-presence`. Nothing pushes: the note is
+                    collected when that session next asks for it.
+
 exit: 0 delivered, 3 no live recipient, 2 usage error"""
+
+
+BUS_ORIGIN_TYPES = ("quote", "synthesis", "pointer")
+
+
+def send_to_hosted(addr, text, cls, ref, origin_type, locator, sources, sid):
+    """Put a note on the outbound leg for a hosted session to collect.
+
+    Refuses rather than defaults on a missing origin. A default would be the one outcome the
+    channel must not produce: content arriving with a provenance nobody chose. The refusal
+    names what each type needs, because the sender is usually an agent and a message it can act
+    on is worth more than a message it can only report.
+    """
+    if origin_type not in BUS_ORIGIN_TYPES:
+        print("agent-send: a note to a hosted session must say where its content came from.\n"
+              "  --origin quote     verbatim material   -> also --locator <URL|DOI|repo@sha>\n"
+              "  --origin pointer   a locator only      -> also --locator <URL|DOI|repo@sha>\n"
+              "  --origin synthesis your own reading    -> also --source <url> (repeatable)\n"
+              "  The other side cannot check this machine's files, so what you send is all the\n"
+              "  provenance it will ever have.", file=sys.stderr)
+        return 2
+    if origin_type in ("quote", "pointer") and not (locator or "").strip():
+        print(f"agent-send: --origin {origin_type} needs --locator <URL|DOI|repo@sha>.",
+              file=sys.stderr)
+        return 2
+    if origin_type == "synthesis" and not sources:
+        print("agent-send: --origin synthesis needs at least one --source <url>.\n"
+              "  A synthesis with no sources is the unprovenanced claim this channel exists to\n"
+              "  refuse. If you have no sources, what you have is a pointer or a quote.",
+              file=sys.stderr)
+        return 2
+    origin = {"type": origin_type}
+    if origin_type in ("quote", "pointer"):
+        origin["locator"] = locator
+    else:
+        origin["sources"] = list(sources)
+
+    known = {h for h, _t in hosted_peers()}
+    if addr not in known:
+        # Not refused: a hosted session that has never called whoami is unknown here and may
+        # still be the intended recipient, and it collects by handle rather than by being
+        # listed. Said out loud, because a silent send to a handle nobody has announced looks
+        # identical to a delivered one.
+        print(f"agent-send: no hosted session has announced the handle {addr}. Sending anyway "
+              f"— it will be collected only if that handle is real.", file=sys.stderr)
+
+    note = {"v": 1, "from": name_for(sid) or short(sid) or "a local session", "to": addr,
+            "kind": "note", "class": cls, "text": text, "origin": origin}
+    if ref:
+        note["ref"] = ref
+    try:
+        mid = bus_write_out(note)
+    except OSError as e:
+        print(f"agent-send: could not write the outbound leg ({e}).", file=sys.stderr)
+        return 1
+    print(f"sent to {addr} as {mid}. Nothing pushes: it reaches that session when it next "
+          f"calls check_notes.")
+    return 0
 
 
 def cmd_send(argv):
@@ -1200,11 +1850,22 @@ def cmd_send(argv):
     # is the first bare token read as an address, and only when no --tree/--all was given --
     # so `agent-send "text" --all` cannot silently swallow the text as an address.
     cls, ref, target_tree_arg, to_all = "advisory", None, None, False
+    origin_type, locator, sources = None, None, []
     bare = []
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a == "--class":
+        if a == "--origin":
+            i += 1
+            origin_type = argv[i] if i < len(argv) else ""
+        elif a == "--locator":
+            i += 1
+            locator = argv[i] if i < len(argv) else ""
+        elif a == "--source":
+            i += 1
+            if i < len(argv):
+                sources.append(argv[i])
+        elif a == "--class":
             i += 1
             cls = argv[i] if i < len(argv) else ""
         elif a == "--ref":
@@ -1247,6 +1908,22 @@ def cmd_send(argv):
 
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     now = time.time()
+
+    # A hosted address goes to the bus, not to the local registry — and it is the one
+    # destination that must say where its content came from. A local peer shares this machine
+    # with you, so a claim it makes can be checked against the same files you can see; a hosted
+    # session's cannot, and the relay this channel replaces failed in exactly that way: the
+    # figure survived and its provenance did not. So the check is here, at the send, where the
+    # sender still knows the answer.
+    if addr and addr.startswith("claude-ai/"):
+        return send_to_hosted(addr, text, cls, ref, origin_type, locator, sources, sid)
+    if origin_type or locator or sources:
+        print("agent-send: --origin/--locator/--source apply only to a hosted address "
+              "(claude-ai/<handle>).\n"
+              "  A note to a local session is read on the machine that produced it.",
+              file=sys.stderr)
+        return 2
+
     live = [r for r in all_records() if is_live(r, now) and r.get("session_id") != sid]
 
     if target_tree_arg is not None:
@@ -1282,8 +1959,12 @@ def cmd_send(argv):
     ensure_dirs()
     for r in recipients:
         write_note(r["session_id"], note)
+    # Naming the SENDER too, because this is the moment it matters and the moment a session
+    # reliably reaches: the recipient renders the note under this name, so a note whose text
+    # signs itself differently reads as coming from two people.
     print(f"delivered to {len(recipients)} session(s): "
-          f"{', '.join(name_for(r['session_id'], r) for r in recipients)}")
+          f"{', '.join(name_for(r['session_id'], r) for r in recipients)}"
+          + (f" — sent as {name_for(sid)}" if sid else ""))
     return 0
 
 
@@ -1316,4 +1997,13 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # `agent-presence --names | head` closes the pipe under us, and the mapping is now
+        # thousands of rows, so this is the ordinary way to read it. Python would otherwise
+        # print a traceback here AND a second "Exception ignored" from the interpreter's own
+        # flush at shutdown, which reads as a broken tool rather than as a closed pager.
+        # Redirecting the fd first is what silences the shutdown flush.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
