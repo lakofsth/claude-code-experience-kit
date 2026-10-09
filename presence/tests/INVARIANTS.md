@@ -134,3 +134,74 @@ half-promoted checkout break every tool call on the host.
   writer's repo and SKIPS with a reason when it is absent, rather than reporting coverage it
   does not have). The write leg carries a positive control, so a validator that had become a
   no-op is a failure rather than a pass.
+
+## `a-peer-chosen-path-renders-on-one-line`
+
+**Every path another session chose that is rendered into this session's context — a tree it
+wrote in, its cwd — occupies one line and is bounded**, exactly as a note body is. The tree
+is the peer's own Edit target after realpath, so a directory name is text the peer picked, and
+a newline in it would render as a second, differently-labelled line outside the delivery
+framing (the hole `one_line()` already closes for notes). Found by the security-posture review
+of 2026-10-08.
+
+- Site derivation: every f-string in a `render_*` function or a hook entry that interpolates a
+  value read from a peer's record (`trees`, `cwd`) — `render_collision`, `cmd_register`,
+  `cmd_list`; the bound is `MAX_PATH_RENDER`.
+- Pin: `TestCollisionWarning.test_a_peer_chosen_path_renders_on_one_line`.
+
+## `a-session-id-is-one-path-component`
+
+**A session id from a hook payload is accepted only in a shape that is a single path
+component** (`SID_SHAPE`: an alphanumeric, then up to 127 of `[A-Za-z0-9_-]`); any other
+value is no id, and the hook is silent and touches nothing. The id names the record, the
+touch lock and the inbox under the registry, and `end` unlinks the record by it: at the base,
+`end` with `"../sessions/bbb"` unlinked another session's record. Found by the
+security-posture review of 2026-10-08.
+
+- Site derivation: every reader of `payload["session_id"]` — `payload_sid()` is the only one,
+  and the three hook entries call it.
+- Pin: `TestHooksNeverBreakTheToolCall.test_a_session_id_that_is_not_a_path_component_is_ignored`.
+
+## `a-names-row-is-one-line-of-four-fields`
+
+**Every row `assign_name()` appends to `names.tsv` is one line of four tab-separated fields,
+whatever the peer-chosen cwd contains.** The cwd comes from the hook payload — text the peer
+picked, like its session id and its trees — and the file is the authority for "which session
+holds this name": at the base a cwd of `"/x\nevil-name\tvictim\t0\t/z"` appended a second row
+that `--names` then listed as `evil-name` held by `victim`. The cwd is written through
+`one_line(…, MAX_PATH_RENDER)`, which collapses every whitespace run including tabs and
+newlines, so a payload field can describe a row but never write one. Found by the
+security-posture review of 2026-10-08 (recorded then as a row-fusing nit; it is a forge).
+
+- Site derivation: every writer of `names_file()` — `assign_name()` is the only one, and the
+  cwd is the only field of its row that a payload supplies verbatim (the name is from the word
+  lists, the sid has passed `SID_SHAPE`, the stamp is an int).
+- Pin: `TestNames.test_a_peer_chosen_cwd_cannot_forge_a_names_row`.
+
+## `an-empty-address-is-not-a-broadcast`
+
+**`agent-send` with an empty-string address is the usage error, not a send to every live
+session.** Prefix matching is how an address resolves, and the empty string is a prefix of every
+name and every id; the explicit `--all` is the only broadcast. Held at the base (the
+security-posture review of 2026-10-08 recorded it as open; re-tested 2026-10-09 it did not
+reproduce), pinned so that a later `is not None` guard cannot reopen it — that one-token change
+delivered to every live session under the pin.
+
+- Site derivation: the address branch of `cmd_send()` — the one site that resolves a bare
+  token to recipients.
+- Pin: `TestNotes.test_an_empty_address_is_a_usage_error_not_a_broadcast`.
+
+## `no-case-depends-on-the-host-claude-code`
+
+**No case's outcome depends on which Claude Code this host has installed**: the suite's
+default PATH holds an interpreter and nothing else, and a case about version skew puts a fake
+install on PATH itself. This suite learned it from a host upgrade that turned a fixture version
+into a "stale process" mid-run and failed a names case; the pin below is what makes the
+property held by construction rather than by every version case remembering to set PATH.
+
+- Site derivation: `Base.env()` — the one place the subject's environment is built; the
+  cases that need a host binary (`head` in the closed-pipe case) put the host PATH back
+  by name.
+- Pin: `TestStaleBinaryWarning.test_the_default_environment_hides_the_hosts_claude_code` —
+  a newer fake install on the test process's own PATH, a stale-looking session, the plain
+  `env()`: no warning. Dropping the PATH line in `env()` turns it red.
