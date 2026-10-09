@@ -496,6 +496,20 @@ class TestNotes(Base):
         self.assertIn("the record `release-plan`", ctx)
         self.assertIn("[directive]", ctx)
 
+    # -- `an-empty-address-is-not-a-broadcast` -----------------------------------------------
+
+    def test_an_empty_address_is_a_usage_error_not_a_broadcast(self):
+        """The empty string is a prefix of every name and every id. Under `elif addr is not
+        None` this delivered to both peers; `--all` is the only broadcast."""
+        for sid in ("aaa", "bbb"):
+            self.write_record(sid)
+        s = self.run_cli(["send", "", "hello"], sid="ccc")
+        self.assertEqual(s.returncode, 2, s.stderr)
+        self.assertIn("usage", s.stderr)
+        inbox = os.path.join(self.state, "inbox")
+        delivered = [f for dp, _, fs in os.walk(inbox) for f in fs] if os.path.isdir(inbox) else []
+        self.assertEqual(delivered, [], delivered)
+
     def test_send_to_nobody_reports_rather_than_silently_succeeding(self):
         s = self.run_cli(["send", "zzz", "anyone there"], sid="aaa")
         self.assertEqual(s.returncode, 3)
@@ -1073,6 +1087,27 @@ class TestNames(Base):
         rows = open(os.path.join(self.state, "names.tsv")).read().splitlines()
         self.assertEqual(len(rows), 1, rows)
 
+    # -- `a-names-row-is-one-line-of-four-fields` --------------------------------------------
+
+    def test_a_peer_chosen_cwd_cannot_forge_a_names_row(self):
+        """The cwd is payload text, and names.tsv is the authority for who holds a name. At the
+        base a newline-then-tabs cwd appended a second row, and `--names` listed `evil-name`
+        as held by `victim`."""
+        forged = "/x\nevil-name\tvictim\t0\t/z"
+        self.run_hook("register", {"session_id": "aaa", "cwd": forged})
+        self.run_hook("pretool", {"session_id": "aaa", "cwd": forged,
+                                  "tool_name": "Read", "tool_input": {}})
+        raw = open(os.path.join(self.state, "names.tsv")).read()
+        rows = raw.splitlines()
+        self.assertEqual(len(rows), 1, raw)
+        fields = rows[0].split("\t")
+        self.assertEqual(len(fields), 4, raw)
+        self.assertEqual(fields[1], "aaa", raw)
+        self.assertNotIn("\t", fields[3], raw)
+        listing = self.run_cli(["list", "--names"]).stdout
+        self.assertNotIn("victim", listing, listing)
+        self.assertNotIn("evil-name", listing, listing)
+
     def test_minting_is_silent(self):
         """An injection on every session's first tool call would break the property that these
         hooks say nothing unless there is a collision or a note."""
@@ -1594,6 +1629,27 @@ class TestStaleBinaryWarning(Base):
         self.assertIn("2.1.220", ctx)
         self.assertIn("2.1.226", ctx)
         self.assertIn("quitting", ctx)
+
+    # -- `no-case-depends-on-the-host-claude-code` -------------------------------------------
+
+    def test_the_default_environment_hides_the_hosts_claude_code(self):
+        """What the suite's default PATH buys. A newer Claude Code is put on THIS PROCESS's
+        PATH — the position the host's real install occupies — and a stale-looking session takes
+        a tool call under the plain env(): no skew warning, because env() replaced PATH with the
+        interpreter-only directory. Without that line the warning fires on whatever the host
+        has installed, which is how this suite once failed a names case."""
+        bindir = self.install_cli("99.0.0")
+        self.write_harness_record("aaa", "thomas-11", version="2.1.220")
+        saved = os.environ.get("PATH", "")
+        os.environ["PATH"] = bindir + os.pathsep + saved
+        try:
+            ctx = self.context_of(self.run_hook("pretool", {"session_id": "aaa", "cwd": "/x",
+                                                            "tool_name": "Read",
+                                                            "tool_input": {}}))
+        finally:
+            os.environ["PATH"] = saved
+        self.assertTrue(ctx is None or "99.0.0" not in ctx,
+                        f"the host's PATH reached the subject: {ctx!r}")
 
     def test_session_start_no_longer_carries_the_skew_warning(self):
         """The move itself. Arming it here is what made it unreachable by its own subject

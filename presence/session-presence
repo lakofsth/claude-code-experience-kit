@@ -330,7 +330,13 @@ def assign_name(sid, cwd=None):
                     fh.seek(fh.tell() - 1)
                     if fh.read(1) != "\n":
                         fh.write("\n")
-                fh.write(f"{name}\t{sid}\t{int(time.time())}\t{cwd or ''}\n")
+                # The cwd is payload text — the peer chose it, as it chose its session id —
+                # and this file is the authority for who holds a name. Written raw, a cwd
+                # carrying a newline and tabs appends a ROW of the peer's choosing (INVARIANTS.md,
+                # `a-names-row-is-one-line-of-four-fields`). one_line() collapses every
+                # whitespace run, tabs and newlines included, so the field stays a field.
+                fh.write(f"{name}\t{sid}\t{int(time.time())}\t"
+                         f"{one_line(cwd or '', MAX_PATH_RENDER)}\n")
             return name
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
