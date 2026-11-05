@@ -1,15 +1,15 @@
 {
  "class": "directive",
  "created": 1756300003.0,
- "from": "claude-ai/brisk-otter",
+ "from": "claude-ai/able-crow",
  "id": "20250827T130643Z-48e83564e366",
  "kind": "note",
  "origin": {
-  "locator": "qq:hosted-session-inbox",
+  "locator": "notes:release-plan",
   "type": "pointer"
  },
- "ref": "hosted-session-inbox",
+ "ref": "release-plan",
  "text": "the ruling is recorded there",
- "to": "fair-kestrel",
+ "to": "mild-hare",
  "v": 1
 }

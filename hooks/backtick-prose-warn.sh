@@ -4,8 +4,7 @@
 # Writing prose through a double-quoted shell string is routine — a commit message, a PR body,
 # a note-store entry. Backticks are equally routine INSIDE that prose (quoting command names in
 # markdown). The shell then executes them: the span vanishes, or worse, the command's OUTPUT is
-# spliced into the record. Observed three times in one session; the third spliced a directory
-# listing into a handoff document, where it would have been read as content.
+# spliced into the record, where it would be read as content.
 #
 # It is pure oversight, not judgment — which is why a notice at the moment of the call is the
 # right instrument: seeing "the shell will execute these" fixes it instantly, whereas no amount
@@ -36,11 +35,10 @@ try:
         sys.exit(0)
 
     # A QUOTED heredoc body is literal DATA handed to some program, not shell performing a
-    # durable write — so blank those bodies out before matching anything. Earned immediately:
-    # the very command that tested this fix was `python3 - <<'PY'` whose body contained a sample
-    # `git commit -F - <<MSG` with backticks as FIXTURE text, and the hook warned about a commit
-    # that was never going to happen. Scanning literal data is how a precise hook becomes noise,
-    # and noise is what this file's header says must never happen.
+    # durable write — so blank those bodies out before matching anything: a `python3 - <<'PY'`
+    # body holding a sample `git commit -F - <<MSG` with backticks is fixture text, not a commit.
+    # Scanning literal data is how a precise hook becomes noise, and noise is what this file's
+    # header says must never happen.
     def _blank_quoted_heredocs(text):
         out, i = [], 0
         for m in re.finditer(r"<<-?\s*(['\"])([A-Za-z_]\w*)\1", text):
@@ -55,16 +53,14 @@ try:
     if "`" not in cmd:
         sys.exit(0)
 
-    # TWO SHAPES, and the second was missing until 2026-08-09.
+    # TWO SHAPES.
     #
     # Shape A: prose inline in an interpolating string  ->  git commit -m "... `x` ..."
     # Shape B: prose in an UNQUOTED heredoc fed to the writer  ->  git commit -F - <<MSG ... MSG
     #
-    # Shape B is the one that bit: this hook's own advice recommends `git commit -F - <<'MSG'`,
-    # and the flag-based patterns below only ever matched `-m`, so the UNQUOTED variant of the
-    # very form the hook tells you to use was invisible to it. Two commit messages were silently
-    # eaten before anyone noticed — a countermeasure whose advice covers a case its detector
-    # does not.
+    # Shape B matters because this hook's own advice recommends `git commit -F - <<'MSG'`: a
+    # detector that matched only `-m` would miss the UNQUOTED variant of the very form the hook
+    # tells you to use, and advice that covers a case its detector does not is no countermeasure.
     #
     # Shape B is matched with the heredoc TIED to the writer on the same command segment
     # ([^|;&\n]*), not merely present somewhere in the command. Otherwise the common and correct

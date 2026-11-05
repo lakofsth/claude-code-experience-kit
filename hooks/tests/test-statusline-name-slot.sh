@@ -47,15 +47,15 @@ check "no names.tsv        -> burn readout" "$(run "$H")" "210k/% ~14t" "-"
 #    here and print the peer's name.
 H=$(fresh_home); echo '210k/% ~14t' > "$H/.claude/.burndown-status.$SID"
 mkdir -p "$H/.local/state/claude-sessions"
-printf 'other-heron\tsome-other-session\t123\t/tmp\n' > "$H/.local/state/claude-sessions/names.tsv"
-check "names.tsv, not ours -> burn readout" "$(run "$H")" "210k/% ~14t" "other-heron"
+printf 'other-name\tsome-other-session\t123\t/tmp\n' > "$H/.local/state/claude-sessions/names.tsv"
+check "names.tsv, not ours -> burn readout" "$(run "$H")" "210k/% ~14t" "other-name"
 
 # 3. names.tsv holds this session — the name takes the slot and the burn is not also printed.
 H=$(fresh_home); echo '210k/% ~14t' > "$H/.claude/.burndown-status.$SID"
 mkdir -p "$H/.local/state/claude-sessions"
-printf 'other-heron\tsome-other-session\t123\t/tmp\nautumn-wren\t%s\t124\t/tmp\n' "$SID" \
+printf 'other-name\tsome-other-session\t123\t/tmp\ntall-yew\t%s\t124\t/tmp\n' "$SID" \
   > "$H/.local/state/claude-sessions/names.tsv"
-check "names.tsv, ours     -> name, no burn" "$(run "$H")" "autumn-wren" "210k/% ~14t"
+check "names.tsv, ours     -> name, no burn" "$(run "$H")" "tall-yew" "210k/% ~14t"
 
 # 4. Neither — the slot is simply empty and the rest of the line still renders.
 H=$(fresh_home)

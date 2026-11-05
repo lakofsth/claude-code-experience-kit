@@ -19,12 +19,12 @@ fivehr=$(j '.rate_limits.five_hour.used_percentage')
 fivereset=$(j '.rate_limits.five_hour.resets_at')
 sid=$(j '.session_id'); sid=${sid:-default}         # per-session key: .gauges is read by inject-gauges
                                                     # in the MATCHING session — a shared file clobbers
-                                                    # across concurrent sessions (fixed 2026-07-10).
+                                                    # across concurrent sessions.
 
 # Persist gauges for the UserPromptSubmit inject-gauges hook (model context awareness).
 # Sentinel '-' for an EMPTY field, never a bare gap: an empty middle field (fivehr unset early
 # in a session) would otherwise collapse under the reader's `read -r ctx fh rs`, shifting the
-# reset EPOCH into the 5h-usage slot ("5h-usage 1783984200% used"). Reproduced + fixed 2026-07-13.
+# reset EPOCH into the 5h-usage slot ("5h-usage 1783984200% used").
 printf '%s %s %s\n' "${pct:--}" "${fivehr:--}" "${fivereset:--}" 2>/dev/null > ~/.claude/.gauges."$sid" || true
 
 # ANSI
@@ -54,8 +54,9 @@ fi
 # turn regardless of what this slot shows.
 #
 # The lookup is fail-open, and that is the whole point of the fallback: no presence installed, no
-# names.tsv, or a session that has not registered yet (a beat at session start) and you get the
-# burn readout exactly as before. A kit user who never installs §11 loses nothing.
+# names.tsv, or a session that has not made its first tool call yet (a name is minted then, not at
+# SessionStart, because most registrations are `claude -p` one-shots that never act) and you get
+# the burn readout exactly as before. A kit user who never installs §11 loses nothing.
 SLOT=$'\033[38;5;175m'                             # light mauve
 name=$(awk -F'\t' -v s="$sid" '$2==s {print $1; exit}' \
        ~/.local/state/claude-sessions/names.tsv 2>/dev/null || true)

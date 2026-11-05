@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# claude-launch — start an interactive Claude Code session under its presence name, so the name
+# peers see on a note (dim-owl) is also the name Claude Code's own SendMessage accepts.
+#
+# WHY. Two registries name the same session: this component's (`dim-owl`, minted from the
+# session id) and Claude Code's (`alice-84`, derived by Claude Code). A peer note is signed
+# with the first and SendMessage resolves only the second, so a reply to `plain-lark` fails with
+# "No agent named 'plain-lark' is reachable". Claude Code takes a name at launch (`--name`,
+# recorded with nameSource "user"), and that name IS its SendMessage address: a session started
+# `--name some-name` is listed and addressable as some-name. So this mints the
+# session id itself, has session-presence issue that id's name (`claim-name`, the same
+# assign_name() a first tool call reaches, so the hook later finds the same row), and starts
+# Claude Code with --session-id and --name. presence/tests/INVARIANTS.md
+# `a-launched-session-answers-to-its-presence-name`.
+#
+# WHAT IT LEAVES ALONE. Anything that is not a fresh interactive session passes through
+# untouched: -p/--print one-shots (which must mint no name, `a-name-is-minted-only-for-a-
+# session-that-acts`), a resume or continue (the session already has its id and names), an
+# explicit --session-id or --name (the caller chose), and a first argument that is a word rather
+# than an option or a prompt with spaces (a subcommand: `claude mcp`, `claude update`). If the
+# name cannot be issued, the session still starts, unnamed, and says why on stderr: a launcher
+# that refused to start Claude Code over a naming problem would cost more than the name.
+#
+# THE REAL BINARY is the first `claude` on PATH that is not this file (by resolved path), or
+# CLAUDE_LAUNCH_REAL when set (the suite's seam).
+set -u
+self=$(readlink -f "${BASH_SOURCE[0]}")
+
+# A MISSING BINARY IS WAITED FOR, up to CLAUDE_LAUNCH_WAIT seconds (default 15): an update of
+# Claude Code (npm reinstalls the package directory) leaves no claude.exe for a few seconds, and
+# a launch in that window would find nothing and exit 127. It re-scans PATH
+# every 0.5 s, says once on stderr that it is waiting, and gives up with the same 127.
+find_real() {
+  local d c
+  IFS=: read -r -a _dirs <<< "${PATH:-}"
+  for d in "${_dirs[@]}"; do
+    c="$d/claude"
+    [ -x "$c" ] && [ ! -d "$c" ] || continue
+    [ "$(readlink -f "$c")" = "$self" ] && continue
+    real=$c; return 0
+  done
+  return 1
+}
+real=${CLAUDE_LAUNCH_REAL:-}
+if [ -z "$real" ] && ! find_real; then
+  wait_s=${CLAUDE_LAUNCH_WAIT:-15}
+  case "$wait_s" in ''|*[!0-9]*) wait_s=15 ;; esac
+  echo "claude-launch: no claude binary on PATH yet (an update in progress?) -- waiting up to ${wait_s}s" >&2
+  tries=$(( wait_s * 2 ))
+  while [ "$tries" -gt 0 ] && ! find_real; do
+    sleep 0.5; tries=$(( tries - 1 ))
+  done
+fi
+if [ -z "$real" ]; then
+  echo "claude-launch: no claude binary on PATH other than this launcher ($self)" >&2
+  exit 127
+fi
+
+fresh=1
+for a in "$@"; do
+  case "$a" in
+    -p|--print|-r|--resume|--resume=*|-c|--continue|--session-id|--session-id=*|-n|--name|--name=*|--fork-session|-h|--help|-v|--version)
+      fresh=0 ;;
+  esac
+done
+if [ "$fresh" = 1 ] && [ $# -gt 0 ]; then
+  case "$1" in
+    -*) ;;
+    *\ *) ;;          # a prompt with spaces: still an interactive session
+    *) fresh=0 ;;     # one bare word: a subcommand (mcp, update, doctor, ...)
+  esac
+fi
+[ "$fresh" = 1 ] || exec "$real" "$@"
+
+presence=${CLAUDE_LAUNCH_PRESENCE:-$(dirname "$self")/session-presence}
+sid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null) || sid=""
+name=""
+if [ -n "$sid" ]; then
+  name=$(python3 "$presence" claim-name "$sid" "$PWD" 2>/dev/null) || name=""
+fi
+case "$name" in
+  [a-z]*-[a-z]*) exec "$real" --session-id "$sid" --name "$name" "$@" ;;
+esac
+echo "claude-launch: could not issue a presence name (session id '${sid:-none}'), starting unnamed" >&2
+exec "$real" "$@"

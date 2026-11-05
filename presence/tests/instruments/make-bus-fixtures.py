@@ -46,35 +46,35 @@ def main():
     base = 1756300000.0
     cases = [
         ("a quote with its locator", {
-            "to": "fair-kestrel", "kind": "note",
-            "text": "poolside report the drafter at 2.81x on the same card",
+            "to": "mild-hare", "kind": "note",
+            "text": "upstream reports the new build at 2.8x on the same hardware",
             "origin": {"type": "quote", "locator": "https://example.invalid/rfc/24528#c17"}}),
         ("a synthesis with its sources", {
-            "to": "fair-kestrel", "kind": "ask",
-            "text": "six independent forks; one has a same-hardware benchmark. Worth measuring?",
+            "to": "mild-hare", "kind": "ask",
+            "text": "four independent implementations; one has a benchmark. Worth measuring?",
             "origin": {"type": "synthesis",
                        "sources": ["https://example.invalid/rfc/24528",
-                                   "https://example.invalid/fork/a",
-                                   "https://example.invalid/fork/b",
-                                   "https://example.invalid/fork/c"]}}),
+                                   "https://example.invalid/impl/a",
+                                   "https://example.invalid/impl/b",
+                                   "https://example.invalid/impl/c"]}}),
         ("a pointer, broadcast", {
             "to": "*", "kind": "note", "text": "the thread that matters is #24528",
             "origin": {"type": "pointer", "locator": "https://example.invalid/rfc/24528"}}),
-        ("a directive, which must point at a HEAD", {
-            "to": "fair-kestrel", "kind": "note", "class": "directive",
-            "ref": "hosted-session-inbox", "text": "the ruling is recorded there",
-            "origin": {"type": "pointer", "locator": "qq:hosted-session-inbox"}}),
+        ("a directive, which must point at a durable record", {
+            "to": "mild-hare", "kind": "note", "class": "directive",
+            "ref": "release-plan", "text": "the ruling is recorded there",
+            "origin": {"type": "pointer", "locator": "notes:release-plan"}}),
         ("a note for somebody else", {
             "to": "some-other-session", "kind": "note", "text": "not for you",
             "origin": {"type": "pointer", "locator": "https://example.invalid/x"}}),
         ("a peer announcing its handle", {
-            "to": "*", "kind": "peer", "handle": "claude-ai/brisk-otter",
-            "text": "hosted session claude-ai/brisk-otter is present",
-            "origin": {"type": "pointer", "locator": "qq-bus-mcp/whoami"}}),
+            "to": "*", "kind": "peer", "handle": "claude-ai/able-crow",
+            "text": "hosted session claude-ai/able-crow is present",
+            "origin": {"type": "pointer", "locator": "bus/whoami"}}),
     ]
     written = []
     for i, (label, over) in enumerate(cases):
-        note = {"v": busspool.SCHEMA_VERSION, "from": "claude-ai/brisk-otter",
+        note = {"v": busspool.SCHEMA_VERSION, "from": "claude-ai/able-crow",
                 "class": "advisory"}
         note.update(over)
         mid = busspool.write_note("in", note, now=base + i)

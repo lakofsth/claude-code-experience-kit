@@ -16,7 +16,9 @@
 #
 #   AGENT_PRESENCE_BIN    where to link the two commands   (default ~/bin)
 #   AGENT_PRESENCE_DIR    where the registry lives         (default ~/.local/state/claude-sessions)
+#   AGENT_PRESENCE_LAUNCHER=1   also link `claude` in that dir to claude-launch (off by default)
 set -uo pipefail
+[ $# -eq 0 ] || { echo "usage: $0   (takes no arguments; any argument is refused before anything is installed)" >&2; exit 2; }
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 BIN="${AGENT_PRESENCE_BIN:-$HOME/bin}"
 STATE="${AGENT_PRESENCE_DIR:-$HOME/.local/state/claude-sessions}"
@@ -50,6 +52,22 @@ case ":$PATH:" in
   *":$BIN:"*) ;;
   *) echo "  NOTE     $BIN is not on your PATH — add it, or set AGENT_PRESENCE_BIN to a dir that is" ;;
 esac
+
+# 2b. the launcher, OPT-IN: `claude` in $BIN, which must come ahead of the real claude on PATH,
+# starts an interactive session under its presence name (presence/tests/INVARIANTS.md
+# `a-launched-session-answers-to-its-presence-name`); everything else passes through to the real
+# claude. Off unless asked for, because it shadows a command you did not install from here.
+if [ "${AGENT_PRESENCE_LAUNCHER:-0}" = 1 ]; then
+  dst="$BIN/claude"
+  if [ -e "$dst" ] && [ ! -L "$dst" ]; then
+    echo "  REFUSED  $dst exists and is not a symlink — inspect it by hand" >&2
+    exit 1
+  fi
+  ln -sf "$HERE/claude-launch" "$dst"
+  echo "  bin      $dst -> $HERE/claude-launch"
+else
+  echo "  launcher not linked (AGENT_PRESENCE_LAUNCHER=1 links $BIN/claude -> $HERE/claude-launch)"
+fi
 
 # 3. state root --------------------------------------------------------------------------------
 # Only the root. The subdirectories are created on first use by ensure_dirs() in the script

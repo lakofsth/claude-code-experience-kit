@@ -5,9 +5,8 @@
 # WHY (clock): the local-time and budget-gauge lines the model sees are injected at
 # UserPromptSubmit, so they are stamped once, when a HUMAN submits. A turn re-woken WITHOUT a
 # new prompt keeps the last prompt's stamp — and that happens routinely: a background-task
-# completion re-invokes the session, and a dormant session can resume hours later. Observed: a
-# single turn spanned 15:03->21:43 (a backgrounded watch task completing six hours later) while
-# the injected time still read 15:03. UserPromptSubmit cannot fix this — there is no submit to
+# completion re-invokes the session, and a dormant session can resume hours later, so a turn
+# can span hours while the injected time still reads its start. UserPromptSubmit cannot fix this — there is no submit to
 # fire on. PreToolUse CAN: it fires on the model's first action after ANY wake.
 #
 # WHY (model): a session can be moved to a different model BETWEEN turns, and nothing in the
@@ -51,7 +50,7 @@ prev=$(cat "$mmark" 2>/dev/null || echo "")
 find "$HOME/.claude" -maxdepth 1 -name '.lastmodel.*' -mtime +1 -delete 2>/dev/null || true
 
 if [ -n "$model" ] && [ -n "$prev" ] && [ "$model" != "$prev" ]; then
-  confirmed=$(tac "$tf" 2>/dev/null | python3 -c '
+  confirmed=$(tac "$tf" 2>/dev/null | python3 -I -c '
 import sys, json
 for line in sys.stdin:
     try:

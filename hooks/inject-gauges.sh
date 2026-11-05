@@ -16,15 +16,10 @@ find ~/.claude -maxdepth 1 \( -name '.gauges.*' -o -name '.burndown-status.*' \)
 src="live"
 if [ -z "$fh$ctx" ]; then read -r ctx fh rs 2>/dev/null < ~/.claude/.gauges."$sid" || true; src="statusline<=60s"; fi
 
-# A percentage is a number in [0,100]; blank anything else. What lands here in the bug is not
-# random garbage but an EPOCH-SHAPED value — the reset Unix timestamp (~1.7e9, 10 digits) that
-# shifted LEFT into the 5h-usage slot when an empty middle field collapsed under `read -r` in an
-# old-format .gauges file (the "5h-usage 1783984200% used" bug). Recognizing the shape is the
-# diagnostic: a 10-digit "percentage" is unmistakably a leaked timestamp, not corruption. Blanking
-# is the right repair (the 5h clause then drops, which is correct — the fivehr field was genuinely
-# empty, which is what caused the collapse; recovering the epoch into rs was tried and reverted, it
-# changed no output because the reset only renders alongside a known fivehr). The clamp also covers
-# a partial write / future format drift; `rs` is a real epoch and is never clamped.
+# A percentage is a number in [0,100]; blank anything else (the 5h clause then drops). An
+# epoch-shaped value (10 digits) in a percentage slot is a reset timestamp shifted left by an empty
+# field under `read -r`; the clamp also covers a partial write or format drift. `rs` is a real
+# epoch and is never clamped.
 _okpct() { case "$1" in ''|-|*[!0-9.]*) return 1;; esac; awk "BEGIN{exit !($1>=0 && $1<=100)}"; }
 _okpct "$ctx" || ctx=""
 _okpct "$fh"  || fh=""
@@ -32,7 +27,7 @@ _okpct "$fh"  || fh=""
 # --- self-calibrating burndown ------------------------------------------------
 burn=""
 if [ -n "$tx" ] && [ -f "$tx" ] && [ -n "$fh" ]; then
-  burn=$(TX="$tx" PCT="$fh" CTXV="${ctx:-}" MODEL="$model" SID="$sid" python3 - <<'PY' 2>/dev/null
+  burn=$(TX="$tx" PCT="$fh" CTXV="${ctx:-}" MODEL="$model" SID="$sid" python3 -I - <<'PY' 2>/dev/null
 import os,json,time
 tx=os.environ["TX"]; pct=float(os.environ["PCT"]); model=os.environ["MODEL"]; sid=os.environ.get("SID","default")
 o=i=cc=cr=0

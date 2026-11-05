@@ -66,7 +66,8 @@ One slot, two tenants. If the presence registry (§11) has a name for this sessi
 takes that slot: with several windows open, *which session this is* matters more to a person
 than tokens-per-percent, and it is what every other presence surface already says. The lookup
 is one `awk` over `~/.local/state/claude-sessions/names.tsv` and it is fail-open — no presence
-installed, no file, or a session that has not registered yet, and you get the burn readout
+installed, no file, or a session that has not made its first tool call yet (a name is minted
+then, not at session start), and you get the burn readout
 exactly as before. **Install nothing from §11 and this section is unchanged.** Nothing is lost
 to the model either way: §2 injects the burndown into its context every turn regardless of
 what the status line shows. `hooks/tests/test-statusline-name-slot.sh` drives all the branches
@@ -113,8 +114,7 @@ above carries the same fit to the model in either case.
 **The problem.** Everything injected at `UserPromptSubmit` is stamped once, when a human
 submits. But turns are routinely re-woken *without* a prompt — a background task completes,
 a dormant session resumes hours later — and the model then reasons from a frozen clock and
-frozen gauges. Observed: one turn spanned 15:03→21:43 while the injected time still read
-15:03. Separately, a session can be **moved to a different model between turns** with
+frozen gauges: a turn can span hours while the injected time still reads its start. Separately, a session can be **moved to a different model between turns** with
 nothing in context saying so; it goes on stamping records with the tier it started as.
 
 **The fix:** `hooks/pretool-clock.sh` on `PreToolUse` (empty matcher = every tool). It fires
@@ -146,7 +146,7 @@ re-locks to an on-the-hour grid after the quiet gap. Your 5h windows then tile t
 predictably, and §2's "resets at" line becomes something the agent can actually plan
 against.
 
-Install: edit user/timezone in the three files, then
+Install: edit the user, the timezone and the claude path in the three files, then
 `session-anchor.sh → ~/.claude/`, units → `/etc/systemd/system/`,
 `systemctl enable --now claude-anchor-hourly.timer`. `Persistent=false` is deliberate:
 never catch up a missed fire — a stale anchor at the wrong minute is worse than none.
@@ -212,7 +212,7 @@ quoted strings and heredocs first so a commit message *mentioning* these command
 (v1 blocked its own commit message — precision is the difference between a guard that's
 obeyed and one that's overridden reflexively).
 
-Three widenings since the first edition, each from a case that got past it:
+The widenings since the first edition, each from a case that got past it:
 
 - **The strip is a real quote mask** (`hooks/quote_mask.py`, bash's own rules,
   length-preserving), not two regexes. The regex pair read the apostrophe in `"it's fine"` as
@@ -222,15 +222,43 @@ Three widenings since the first edition, each from a case that got past it:
   every `"..."` wholesale, so a backticked `pkill -f …` inside an unquoted heredoc or a
   double-quoted string ran unexamined. Live `` `…` `` and `$(…)` are now carried out of those
   spans and tested as shell code in their own right.
-- **A process name is not an owner.** `pkill -x name` stops *every* process with that name; on
-  one host `pkill -x llama-server` reached four processes and three belonged to other
-  services. `-x` is now counted at hook time (`pgrep -x`, the same matcher) and refused only
+- **A process name is not an owner.** `pkill -x name` stops *every* process with that name, and
+  on a shared host several processes of other services can carry it. `-x` is now counted at hook time (`pgrep -x`, the same matcher) and refused only
   when it would reach more than one process — and an `until`/`while` gate on *any* `pgrep`
   is refused too, since it hangs on a shared name just as surely as on a self-match. The
   advice the guard prints names the PID you captured and a resource gate instead.
+- **Commands, not spellings.** Each arm used to be a regex over one spelling of its danger, and
+  dozens of ordinary spellings slipped past each one: `pkill myserver` (a name kill
+  not spelled `-x`), `ps aux | grep … | xargs kill`, `bash -c 'pkill -f …'`, `/usr/bin/pkill`,
+  an option before `-f`. The command is now *parsed* (`hooks/bash_parse.py`, on the same quote
+  mask) into simple commands; each command word is resolved past wrappers, redirections and
+  assignments; pkill/pgrep options are read the way procps reads them, abbreviated long options
+  included; and every name-keyed kill is counted with the command's own matcher.
+- **Code handed on is code.** The string of `bash -c`, `eval`, `env -S`, a herestring or heredoc
+  fed to a shell, `flock -c`, `su -c`, `watch`, `find -exec`, `parallel`, `git rebase -x`, `ssh`
+  to this same host — and of any program whose man-page synopsis ends `COMMAND [ARG]...` — is
+  read as the shell would run it, and a lister's pids are followed through variables, pipes and
+  `xargs` to the kill they reach (and only counted when they reach one).
+- **Whole-account and pattern-less kills.** `kill -1`, `kill 0`, `pkill -u "$USER"`, a `ps`
+  listing by owner into a kill, and a pkill whose only criterion is `-n`/`-o` reach far more than
+  one process and are refused; an owner or group filter is counted, not passed.
 
-`hooks/tests/test-block-unsafe-kill.py` runs the guard against 19 commands that must block and
-16 that must pass, with real processes holding a shared name.
+Stated limits, all in the script's header: code a shell assembles at run time (a variable not
+assigned a literal in the same call, a sourced file, a script it runs) is not seen, a remote
+command runs on another host and is not read, and a pid read from a file is a kill by PID. A
+helper of your own that filters out its own ancestry needs no exemption: it is not a kill word.
+The guard's header also cites a run-time half (a `kill` function read through `BASH_ENV`) that
+is a prototype in the original and is not shipped here; the arm that refuses a lister beside
+a kill *that half could not see* — under `sudo`, over `ssh`, by an absolute path, in an
+interpreter — is decided by the words alone and stands without it.
+
+`hooks/tests/` carries the guard's suites — `test-block-unsafe-kill.py` (129 cases) and 65
+more for the parser, the mask and each widening — run against real processes holding a shared
+name. The shell lines they compare against bash itself run through `hooks/tests/bash_oracle.py`,
+in a namespace where no host process can be signalled and nothing is written under your `HOME`.
+The invariants the guard, its parser and these suites cite by id (`mh-…`) are stated in
+`hooks/tests/INVARIANTS.md`, one sentence each with the sites it binds and the tests that pin it; `hooks/tests/test-cited-invariants-resolve.py`
+fails if any cited id does not resolve there, or if the file holds an entry nothing cites.
 
 ## 8. Backtick-prose notice
 
@@ -268,12 +296,11 @@ restart. Docs: <https://code.claude.com/docs/en/keybindings>.
 ## 11. Peer presence and a peer-note inbox
 
 **The problem.** Several Claude Code sessions run on one host at once and cannot see each
-other. In one evening (2026-08-08) that cost four collisions: one session left uncommitted
-work in a shared tree that another nearly merged over; one re-analysed a defect the other
-already had a fix for; one pushed while the other held unpublished commits; one amended a
-commit that had already been mirrored. Every one of those was a fact that already existed on
-the machine, with no path between the two processes — a person carried each of them across by
-hand.
+other, and that costs collisions: one session leaves uncommitted work in a shared tree that
+another merges over; one re-analyses a defect the other already has a fix for; one pushes while
+the other holds unpublished commits; one amends a commit that has already been mirrored. Each of
+those is a fact that already exists on the machine, with no path between the two processes,
+unless a person carries it across by hand.
 
 **The fix:** `presence/session-presence`, two halves of one mechanism.
 
@@ -306,7 +333,7 @@ test that quantifies over it.
 
 **Names** are drawn from a sized pool, rehashed on contention rather than suffixed, cooled for
 a fortnight after a session ends before they can be reissued, and `agent-presence --names`
-answers "which session was *amber-heron*" for any date — `names.tsv` is append-only.
+answers "which session was *plain-lark*" for any date — `names.tsv` is append-only.
 
 **A hosted leg, optional.** Besides local peers, the inbox can read notes written into
 `<state>/bus/in` by a relay from a session running somewhere else (claude.ai, a hosted agent).
@@ -320,15 +347,15 @@ there is simply nothing in `bus/in`, and nothing changes.
 
 ### Names, not uuids
 
-Sessions are surfaced by **name** — `level-wren`, `early-heron` — because a 36-character uuid
+Sessions are surfaced by **name** — `dim-owl`, `soft-moth` — because a 36-character uuid
 is not something a person can hold in mind or say out loud, and every warning, note and
 listing is read by one. A name is derived from the session id (32 adjectives × 32 nouns), so
 the same id always yields the same name and an **uncontended** name can be recomputed from the
-id alone. One that had to be disambiguated (`amber-heron-2`) cannot — the suffix depends on
+id alone. One that had to be disambiguated (`plain-lark-2`) cannot — the suffix depends on
 what was already taken — so the durable mapping, not the derivation, is authoritative.
 
 Allocation checks every name ever issued *plus* every name a live record still holds, because
-the point is to answer *which session was `amber-heron`* days later. The honest bound: a name
+the point is to answer *which session was `plain-lark`* days later. The honest bound: a name
 is not reissued to a different session **while either the mapping or the holder's own record
 survives**. Lose both at once — a wiped state directory — and a name can be reused. That is
 why the mapping is never reaped: records age out of the live window after 30 minutes and are
@@ -366,23 +393,44 @@ Three bounds worth knowing, each of which this tool reports rather than papering
   session; `agent-send` can. Its name is still printed, because that is how you recognise it,
   but marked `(no SendMessage socket — reach it with agent-send)`.
 
+**One name in both registries, optionally.** Claude Code accepts a name at launch (`--name`), and
+that name *is* its `SendMessage` address. `presence/claude-launch` uses that: started fresh and
+interactive, it mints the session id itself, has `session-presence claim-name` issue that id's
+presence name, and runs the real Claude Code with `--session-id <id> --name <presence-name>` —
+so the name a peer note is signed with also routes. `/clear` gives the process a new session id
+while Claude Code keeps the name, and the registry then keeps it too rather than minting a second
+one. One-shots (`-p`), resumes, an explicit `--name` or `--session-id` and subcommands pass
+through untouched; if no name can be issued the session still starts, unnamed, and says why. It
+finds the real binary as the first `claude` on `PATH` that is not itself, and waits a few seconds
+for one to appear (an update in progress) before giving up with 127. The installer links it as
+`claude` only when asked (`AGENT_PRESENCE_LAUNCHER=1`), because it shadows a command you did not
+install from here; sessions started without it keep their derived Claude Code name and are
+reached with `agent-send`, which accepts either name.
+
 ### Using it
 
 ```
 agent-presence                 who is live, where they are writing, what is undelivered
 agent-presence --all           include sessions that have aged out
 agent-presence --json          one JSON record per line
+agent-presence --owner ~/proj  the ONE running session that wrote under ~/proj in the last 6 h
 
 agent-send --all "force-pushing the mirror in 30s"
 agent-send --tree ~/proj "do not merge — I hold an uncommitted fix in parser.py"
-agent-send level-wren "I already have a fix for that crash"
-agent-send level-wren --class directive --ref release-plan "priority changed"
+agent-send dim-owl "I already have a fix for that crash"
+agent-send dim-owl --class directive --ref release-plan "priority changed"
 ```
 
 Address a session by name **or by any prefix of its session id** — for when a log or a
 transcript gave you the id and not the name. Exit codes for `agent-send`: `0` delivered, `3` no
 live recipient, `2` usage error; a send that reaches nobody says so rather than succeeding
 quietly.
+
+`--owner` is for a dispatcher that hands work to the session already in a repo: it
+prints `<session-id>\t<presence-name>\t<messaging-name or ->` when exactly one running session
+wrote there within the window (`--within SECONDS` to change it), and nothing, exit 0, when none
+or several did — several is no owner, because "the latest writer" flips with every save. A
+session idle at a prompt still counts as running while Claude Code's own process record says so.
 
 Every delivery is labelled as an untrusted peer **claim**: a note may be acted on defensively
 (wait, re-check, do not merge) and is not a work order. An **advisory** note (the default) is
@@ -434,10 +482,11 @@ prints the absolute path for you.) `PreToolUse` has an empty matcher on purpose 
 tool call, which is what makes a note arrive within seconds. Each hook is fail-open: one that
 breaks a tool call is worse than no hook.
 
-`presence/tests/test-session-presence.py` (120 cases) drives the real script as a subprocess
+`presence/tests/test-session-presence.py` (186 cases) drives the real script as a subprocess
 across the real stdin boundary, with the registry, the `.claude` home, `HOME` and `PATH` all
 redirected into a tmpdir — and refuses to run at all if the subject does not resolve its
-registry inside that tmpdir.
+registry inside that tmpdir. `presence/tests/test-claude-launch-waits.py` drives the launcher's
+wait for a missing binary.
 
 ---
 
@@ -453,7 +502,9 @@ effect on the next turn — no restart.
 §7/§8 guards, all of §11), `git` (statusline branch display only — degrades gracefully).
 
 **Tests:** `hooks/tests/` and `presence/tests/` run from a checkout with no arguments and exit
-non-zero on failure.
+non-zero on failure, one file at a time (`python3` for a `.py`, `bash` for a `.sh`). The §7 suites
+that ask bash itself how it reads a line need util-linux `unshare` and `setpriv` and
+unprivileged user namespaces.
 
 **Ordering note:** §1's statusline persists the gauges file that §2 falls back on and §3
 reads — install §1 first if you want all three telling one story.
